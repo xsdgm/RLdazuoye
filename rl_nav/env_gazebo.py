@@ -8,6 +8,7 @@ import numpy as np
 import math
 import os
 import time
+import random
 import threading
 from ament_index_python.packages import get_package_share_directory
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -68,20 +69,31 @@ class GazeboEnv(Node):
         # Note: We don't block here indefinitely because sometimes the service takes time to appear
         # or we might want to fallback. But for now we follow user instructions.
         
-        # Goals (Approximate coordinates for TurtleBot3 House)
-        self.goals = [
-            (1.0, 1.0), (2.0, -1.0), (0.0, 2.0), (-1.0, 1.0),
-            (-2.0, -1.0), (1.5, 0.0), (-0.5, -1.5)
+        # Define house boundaries (approximate for TurtleBot3 House)
+        # The house layout is roughly within these bounds
+        self.house_bounds = {
+            'x_min': -3.0,
+            'x_max': 3.0,
+            'y_min': -2.5,
+            'y_max': 2.5
+        }
+        
+        # Define wall-free zones for spawning and goals (approximate room areas)
+        # Format: (x_min, x_max, y_min, y_max)
+        self.safe_zones = [
+            # Living room / Center area
+            (-2.5, -0.5, -1.0, 1.5),
+            # Right side rooms
+            (0.3, 2.5, -1.5, 1.5),
+            # Back area
+            (-1.5, 1.5, 1.2, 2.2),
+            # Bottom area
+            (-2.0, 1.5, -2.0, -0.8)
         ]
         
-        # Safe Spawn Poses (x, y, z, yaw)
-        self.spawn_poses = [
-            (-1.5, 0.5, 0.01, 0.0),
-            (-1.5, -0.5, 0.01, 0.0),
-            (0.5, 0.5, 0.01, 0.0),
-            (0.5, -0.5, 0.01, 0.0),
-            (-2.0, 1.0, 0.01, 0.0) # User suggested safe spot
-        ]
+        # Margin from walls for safety
+        self.spawn_margin = 0.3
+        self.goal_margin = 0.2
         
         self.lock = threading.Lock()
         
@@ -191,22 +203,61 @@ class GazeboEnv(Node):
             return False
         return True
         
+    def generate_random_spawn_pose(self):
+        """Generate a random spawn position within safe zones of the house."""
+        # Randomly select a safe zone
+        zone = random.choice(self.safe_zones)
+        x_min, x_max, y_min, y_max = zone
+        
+        # Add margin to avoid spawning too close to walls
+        x_min += self.spawn_margin
+        x_max -= self.spawn_margin
+        y_min += self.spawn_margin
+        y_max -= self.spawn_margin
+        
+        # Generate random position within the zone
+        x = random.uniform(x_min, x_max)
+        y = random.uniform(y_min, y_max)
+        z = 0.01
+        
+        # Generate random yaw (orientation) in [0, 2*pi]
+        yaw = random.uniform(0, 2 * math.pi)
+        
+        return x, y, z, yaw
+    
+    def generate_random_goal(self):
+        """Generate a random goal position within safe zones of the house."""
+        # Randomly select a safe zone
+        zone = random.choice(self.safe_zones)
+        x_min, x_max, y_min, y_max = zone
+        
+        # Add margin to avoid goals too close to walls
+        x_min += self.goal_margin
+        x_max -= self.goal_margin
+        y_min += self.goal_margin
+        y_max -= self.goal_margin
+        
+        # Generate random position within the zone
+        x = random.uniform(x_min, x_max)
+        y = random.uniform(y_min, y_max)
+        
+        return x, y
+        
     def reset(self):
         # Stop robot
         twist = Twist()
         self.cmd_vel_pub.publish(twist)
         
-        # Pick random pose
-        import random
-        sx, sy, sz, syaw = random.choice(self.spawn_poses)
+        # Generate random spawn pose within house
+        sx, sy, sz, syaw = self.generate_random_spawn_pose()
         
         # Respawn robot at random pose
         success = self.respawn_robot(sx, sy, syaw)
         if not success:
             self.get_logger().warn('Respawn failed; robot may stay at previous location')
         
-        # Pick new goal
-        self.current_goal = random.choice(self.goals)
+        # Generate random goal position within house
+        self.current_goal = self.generate_random_goal()
         
         self.step_count = 0
         self.last_action = np.array([0.0, 0.0])
@@ -261,6 +312,10 @@ class GazeboEnv(Node):
         # 3. Approach Reward (Simplified)
         # Ideally we need previous distance, but for now just distance penalty
         reward -= dist * 0.1
+
+        # Proximity reward: closer to goal yields larger bonus
+        proximity_bonus = 1.0 / (dist + 0.5)
+        reward += proximity_bonus
         
         # 4. Smoothness/Time Penalty
         reward -= 0.01 # Time step
