@@ -47,7 +47,7 @@ class GazeboEnv(Node):
         self.last_action = np.array([0.0, 0.0])
         self.step_count = 0
         self.prev_goal_dist = None  # Track previous distance to goal for shaped reward
-        self.APPROACH_GAIN = 2.0    # Reward weight for getting closer to the goal
+        self.APPROACH_GAIN = 20.0    # Reward weight for getting closer to the goal
         self.robot_name = 'burger'  # Entity name in Gazebo
         self.last_collision_time = None  # Track last collision time for cooldown
         self.COLLISION_COOLDOWN = 2.0  # Seconds before applying collision penalty again
@@ -461,32 +461,25 @@ class GazeboEnv(Node):
         # Wait for action to take effect
         time.sleep(0.1) # 10Hz control
         
-        # Check if robot is flipped and fix it
-        is_flipped, roll, pitch = self._is_robot_flipped()
-        if is_flipped:
-            self.get_logger().warn(f"Robot flipped detected! Roll: {math.degrees(roll):.1f}°, Pitch: {math.degrees(pitch):.1f}°. Resetting position...")
-            # Stop the robot
-            twist = Twist()
-            self.cmd_vel_pub.publish(twist)
-            time.sleep(0.1)
-            
-            # Get current position
-            with self.lock:
-                px = self.odom_data.pose.pose.position.x
-                py = self.odom_data.pose.pose.position.y
-                q = self.odom_data.pose.pose.orientation
-                _, _, yaw = self._quaternion_to_euler(q)
-            
-            # Respawn at current position with correct orientation (no flip)
-            self.respawn_robot(px, py, yaw)
-            time.sleep(0.3)
-        
         # Get new state
         lidar, state, dist, heading_error = self.get_state()
         
         # Calculate Reward
         reward = 0
         done = False
+        
+        # Check if robot is flipped - if so, end episode immediately
+        is_flipped, roll, pitch = self._is_robot_flipped()
+        if is_flipped:
+            self.get_logger().warn(f"Robot flipped detected! Roll: {math.degrees(roll):.1f}°, Pitch: {math.degrees(pitch):.1f}°. Ending episode...")
+            # Stop the robot
+            twist = Twist()
+            self.cmd_vel_pub.publish(twist)
+            # Apply penalty and terminate episode
+            reward = -self.COLLISION_PENALTY
+            done = True
+            print(f"Robot flipped! penalty={self.COLLISION_PENALTY}")
+            return lidar, state, reward, done, {}
         
         # 1. Goal Reward
         if dist < self.GOAL_DIST_THRESHOLD:
@@ -506,10 +499,16 @@ class GazeboEnv(Node):
                 print(f"Collision! penalty={self.COLLISION_PENALTY}")
             
         # 3. Approach Reward: encourage progress toward goal using distance delta
+        # If moving away from goal, apply 25% penalty of approach gain
         if not done:
             if self.prev_goal_dist is not None:
                 delta = self.prev_goal_dist - dist  # positive if getting closer
-                reward += delta * self.APPROACH_GAIN
+                if delta >= 0:
+                    # Getting closer to goal
+                    reward += delta * self.APPROACH_GAIN
+                else:
+                    # Moving away from goal - apply 25% penalty
+                    reward += delta * self.APPROACH_GAIN * 0.25
             self.prev_goal_dist = dist
 
         # 3.1 Heading Alignment Reward: reward reduction in absolute heading error
