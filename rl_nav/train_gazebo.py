@@ -13,7 +13,7 @@ def main():
     rclpy.init()
     
     # Create Environment Node
-    env = GazeboEnv()
+    env = GazeboEnv(goal_tolerance=0.3, collision_penalty=50.0)
     
     # Spin in a separate thread
     spin_thread = threading.Thread(target=rclpy.spin, args=(env,), daemon=True)
@@ -27,7 +27,7 @@ def main():
         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
     
     # Initialize PPO Agent with GPU support
-    agent = PPOAgent(state_dim=7, lidar_dim=360, action_dim=2, device=device)
+    agent = PPOAgent(state_dim=7, lidar_dim=360, action_dim=2, device=device, entropy_coef=0.01)
     
     # Training Parameters
     MAX_EPISODES = 1000
