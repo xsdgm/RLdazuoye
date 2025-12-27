@@ -14,26 +14,34 @@ from ament_index_python.packages import get_package_share_directory
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 class GazeboEnv(Node):
-    def __init__(self, goal_tolerance: float = 0.2, collision_penalty: float = 50.0):
+    def __init__(self, goal_tolerance: float = 0.2, collision_penalty: float = 50.0, start_episode: int = 1):
         super().__init__('rl_navigation_env')
         
         # Constants
         # Distance within which the goal is considered reached
         self.GOAL_DIST_THRESHOLD = float(goal_tolerance)
-        self.COLLISION_DIST = 0.18
-        self.COLLISION_PENALTY = float(collision_penalty)
+        self.COLLISION_DIST = 0.12
+        self.COLLISION_PENALTY = 100.0  # Collision penalty
+        
+        # MAX_STEPS will be dynamically set in reset()
         self.MAX_STEPS = 500
 
         # Anti-spin shaping
-        self.SPIN_V_THRESHOLD = 0.02   # m/s, consider near-zero forward motion
+        self.SPIN_V_THRESHOLD = 0.05   # m/s, consider near-zero forward motion
         self.SPIN_W_THRESHOLD = 0.3    # rad/s, turning considered significant
-        self.SPIN_PENALTY = 0.2        # penalty per step for spinning in place
+        self.SPIN_PENALTY = 0.1        # penalty per step for spinning in place
 
         # Heading alignment shaping
-        self.HEADING_ALIGN_GAIN = 0.5  # reward for reducing |heading_error|
+        self.HEADING_ALIGN_GAIN = 0.05  # reward for reducing |heading_error|
 
         # Forward bias when far from goal
-        self.FORWARD_BIAS_GAIN = 0.05  # small reward proportional to forward speed
+        self.FORWARD_BIAS_GAIN = 0.05  # modest reward proportional to forward speed
+        
+        # Continuous turning detection
+        self.turning_history = []  # Track recent angular velocities
+        self.TURNING_HISTORY_SIZE = 5  # Number of steps to track
+        self.CONTINUOUS_TURN_THRESHOLD = 0.5  # rad/s, sustained turning
+        self.CONTINUOUS_TURN_PENALTY = 0.05  # penalty for连续转向
         
         # Action Limits (TurtleBot3 Burger)
         self.MAX_V = 0.22
@@ -47,7 +55,14 @@ class GazeboEnv(Node):
         self.last_action = np.array([0.0, 0.0])
         self.step_count = 0
         self.prev_goal_dist = None  # Track previous distance to goal for shaped reward
-        self.APPROACH_GAIN = 20.0    # Reward weight for getting closer to the goal
+        self.APPROACH_GAIN = 10.0    # Reward weight for getting closer to the goal (and away penalty)
+
+        # --- Reward Annealing Parameters ---
+        self.INITIAL_APPROACH_GAIN = 10.0  # Starting value for the approach reward gain
+        self.FINAL_APPROACH_GAIN = 2.0     # Final value after decay
+        self.APPROACH_GAIN_DECAY_UNTIL_EPISODE = 500  # Episode count to reach final value
+        # ------------------------------------
+
         self.robot_name = 'burger'  # Entity name in Gazebo
         self.last_collision_time = None  # Track last collision time for cooldown
         self.COLLISION_COOLDOWN = 2.0  # Seconds before applying collision penalty again
@@ -55,6 +70,32 @@ class GazeboEnv(Node):
         # Flip detection thresholds (in radians)
         self.FLIP_ROLL_THRESHOLD = 0.35  # ~20 degrees
         self.FLIP_PITCH_THRESHOLD = 0.35  # ~20 degrees
+        
+        # Training curriculum: start with same room, then different rooms
+        self.episode_count = start_episode - 1
+        self.SAME_ROOM_EPISODES = 500  # Backward-compat threshold
+        # Curriculum stages
+        self.CURRICULUM_STAGES = {
+            'stage1': 100,   # Same room, easy line-of-sight
+            'stage2': 200,   # Near doorway or slight obstacle
+            'stage3': 350,   # Adjacent room
+            'stage4': 500    # Must pass another room
+        }
+        # Track last spawn zone/pose for curriculum logic
+        self.last_spawn_zone = None
+        self.last_spawn_pose = None
+
+        # Zone adjacency mapping (approximate topology of TurtleBot3 house)
+        self.zone_adjacency = {
+            "Top-Left Room": ["Top-Middle-Left Room", "Left Corridor"],
+            "Top-Middle-Left Room": ["Top-Left Room", "Top-Middle-Right Room", "Left Corridor", "Central Hall"],
+            "Top-Middle-Right Room": ["Top-Middle-Left Room", "Top-Right Room", "Central Hall", "Right Corridor"],
+            "Top-Right Room": ["Top-Middle-Right Room", "Right Corridor"],
+            "Left Corridor": ["Top-Left Room", "Top-Middle-Left Room", "Bottom-Left Room", "Central Hall"],
+            "Bottom-Left Room": ["Left Corridor"],
+            "Central Hall": ["Left Corridor", "Top-Middle-Left Room", "Top-Middle-Right Room", "Right Corridor"],
+            "Right Corridor": ["Top-Right Room", "Top-Middle-Right Room", "Central Hall"]
+        }
         
         # QoS-
         qos = QoSProfile(
@@ -364,40 +405,107 @@ class GazeboEnv(Node):
         y = (y_min + y_max) / 2
         return x, y, 0.01, 0.0
     
-    def generate_random_goal(self):
-        """Generate a random goal position within safe zones of the house."""
-        max_attempts = 50
+    def generate_random_goal(self, target_zone=None):
+        """Generate a curriculum-aware random goal position.
+
+        If `target_zone` is provided, generate the goal inside that zone.
+        Otherwise, choose zones based on `episode_count` and the last spawn zone
+        to implement staged difficulty.
+        """
+        max_attempts = 60
+
+        # Determine candidate zones according to curriculum stages
+        candidate_zones = []
+        mode = "any"
+
+        if target_zone is not None:
+            candidate_zones = [target_zone]
+            mode = "target_zone"
+        else:
+            spawn_zone = self.last_spawn_zone
+            episode = self.episode_count
+            if spawn_zone is not None:
+                spawn_zone_name = spawn_zone[4]
+                adjacent_names = self.zone_adjacency.get(spawn_zone_name, [])
+
+                if episode <= self.CURRICULUM_STAGES['stage1']:
+                    # Stage 1: same room, prefer easy line-of-sight
+                    candidate_zones = [spawn_zone]
+                    mode = "same_room_los"
+                elif episode <= self.CURRICULUM_STAGES['stage2']:
+                    # Stage 2: place goal near doorway (zone boundary) in same room
+                    candidate_zones = [spawn_zone]
+                    mode = "doorway_near"
+                elif episode <= self.CURRICULUM_STAGES['stage3']:
+                    # Stage 3: adjacent rooms
+                    candidate_zones = [z for z in self.safe_zones if z[4] in adjacent_names]
+                    mode = "adjacent"
+                elif episode <= self.CURRICULUM_STAGES['stage4']:
+                    # Stage 4: non-adjacent rooms (force multi-room traversal)
+                    candidate_zones = [z for z in self.safe_zones if z != spawn_zone and z[4] not in adjacent_names]
+                    mode = "multi_room"
+                else:
+                    candidate_zones = list(self.safe_zones)
+                    mode = "any"
+            else:
+                candidate_zones = list(self.safe_zones)
+                mode = "any"
+
+        if not candidate_zones:
+            candidate_zones = list(self.safe_zones)
+            mode = "any"
+
         for attempt in range(max_attempts):
-            # Randomly select a safe zone
-            zone = random.choice(self.safe_zones)
+            zone = random.choice(candidate_zones)
             x_min, x_max, y_min, y_max, zone_name = zone
-            
-            # Add margin to avoid goals too close to walls
-            x_min += self.goal_margin
-            x_max -= self.goal_margin
-            y_min += self.goal_margin
-            y_max -= self.goal_margin
-            
-            # Ensure min < max after margin
-            if x_min >= x_max or y_min >= y_max:
-                continue
-            
-            # Generate random position within the zone
-            x = random.uniform(x_min, x_max)
-            y = random.uniform(y_min, y_max)
-            
-            # Validate position is within house
+
+            # Base margins
+            xm = self.goal_margin
+            ym = self.goal_margin
+
+            # Adjust sampling according to mode
+            if mode == "doorway_near":
+                # Sample close to one of the zone boundaries to simulate doorway proximity
+                edge = random.choice(["left", "right", "bottom", "top"])
+                if edge == "left":
+                    x = x_min + xm
+                    y = random.uniform(y_min + ym, y_max - ym)
+                elif edge == "right":
+                    x = x_max - xm
+                    y = random.uniform(y_min + ym, y_max - ym)
+                elif edge == "bottom":
+                    y = y_min + ym
+                    x = random.uniform(x_min + xm, x_max - xm)
+                else:  # top
+                    y = y_max - ym
+                    x = random.uniform(x_min + xm, x_max - xm)
+            elif mode == "same_room_los" and self.last_spawn_pose is not None:
+                # Place goal along a line from spawn toward room center, staying inside zone
+                sx, sy = self.last_spawn_pose
+                cx = (x_min + x_max) / 2
+                cy = (y_min + y_max) / 2
+                # Step a fraction toward center to keep line-of-sight simple
+                alpha = random.uniform(0.4, 0.8)
+                x = sx + alpha * (cx - sx)
+                y = sy + alpha * (cy - sy)
+                # Clamp to margins inside zone
+                x = min(max(x, x_min + xm), x_max - xm)
+                y = min(max(y, y_min + ym), y_max - ym)
+            else:
+                # Default: uniform inside zone with margin
+                x = random.uniform(x_min + xm, x_max - xm)
+                y = random.uniform(y_min + ym, y_max - ym)
+
             if not self._is_valid_position(x, y):
                 continue
-            
+
             room = self._get_room_name(x, y)
-            self.get_logger().debug(f"Goal position generated in {room}: ({x:.2f}, {y:.2f})")
-            
+            self.get_logger().debug(f"Goal ({x:.2f}, {y:.2f}) in {room} via mode={mode}")
             return x, y
-        
-        # Fallback to center of first safe zone
+
+        # Fallback: center of selected zone or first safe zone
         self.get_logger().warn("Could not find valid goal pose after max attempts, using fallback")
-        zone = self.safe_zones[0]
+        zone = candidate_zones[0] if candidate_zones else self.safe_zones[0]
         x_min, x_max, y_min, y_max, zone_name = zone
         x = (x_min + x_max) / 2
         y = (y_min + y_max) / 2
@@ -409,6 +517,28 @@ class GazeboEnv(Node):
         self.cmd_vel_pub.publish(twist)
         time.sleep(0.1)
         
+        # Increment episode counter
+        self.episode_count += 1
+
+        # --- ANNEALING LOGIC ---
+        # Anneal the approach gain based on the episode count
+        progress = min(1.0, self.episode_count / self.APPROACH_GAIN_DECAY_UNTIL_EPISODE)
+        self.APPROACH_GAIN = self.INITIAL_APPROACH_GAIN - (self.INITIAL_APPROACH_GAIN - self.FINAL_APPROACH_GAIN) * progress
+        # -----------------------
+
+        # Dynamically set MAX_STEPS based on curriculum
+        episode = self.episode_count
+        if episode <= self.CURRICULUM_STAGES['stage1']:
+            self.MAX_STEPS = 800
+        elif episode <= self.CURRICULUM_STAGES['stage2']:
+            self.MAX_STEPS = 1000
+        elif episode <= self.CURRICULUM_STAGES['stage3']:
+            self.MAX_STEPS = 1200
+        elif episode <= self.CURRICULUM_STAGES['stage4']:
+            self.MAX_STEPS = 1500
+        else:
+            self.MAX_STEPS = 1800
+        
         # Generate random spawn pose within house
         sx, sy, sz, syaw = self.generate_random_spawn_pose()
         
@@ -417,14 +547,30 @@ class GazeboEnv(Node):
         if not success:
             self.get_logger().warn('Respawn failed; robot may stay at previous location')
         
-        # Generate random goal position within house
+        # Determine spawn zone for curriculum learning
+        spawn_zone = None
+        for zone in self.safe_zones:
+            x_min, x_max, y_min, y_max, zone_name = zone
+            if x_min <= sx <= x_max and y_min <= sy <= y_max:
+                spawn_zone = zone
+                break
+        
+        # Track spawn context for curriculum and generate goal according to stage
+        self.last_spawn_zone = spawn_zone
+        self.last_spawn_pose = (sx, sy)
         self.current_goal = self.generate_random_goal()
+        self.get_logger().info(
+            f"Episode {self.episode_count}: Curriculum active, MAX_STEPS={self.MAX_STEPS}, "
+            f"ApproachGain={self.APPROACH_GAIN:.2f}"
+        )
+
         gx, gy = self.current_goal
         self.get_logger().info(f"New goal set: ({gx:.2f}, {gy:.2f})")
         
         self.step_count = 0
         self.last_action = np.array([0.0, 0.0])
         self.last_collision_time = None  # Reset collision cooldown
+        self.turning_history = []  # Reset turning history
         
         # Wait longer for sensor data to stabilize after respawn
         time.sleep(0.8)
@@ -441,6 +587,10 @@ class GazeboEnv(Node):
         return lidar, state
         
     def step(self, action):
+        # Clip action to ensure it's strictly within [-1, 1]
+        # This prevents action space violations from the neural network
+        action = np.clip(action, -1.0, 1.0)
+        
         # Action: [v_scale, w_scale] in [-1, 1]
         # Map to [0, MAX_V] and [-MAX_W, MAX_W]
         
@@ -483,7 +633,7 @@ class GazeboEnv(Node):
         
         # 1. Goal Reward
         if dist < self.GOAL_DIST_THRESHOLD:
-            reward += 200
+            reward += 500
             done = True
             print("Goal Reached!")
             
@@ -499,7 +649,7 @@ class GazeboEnv(Node):
                 print(f"Collision! penalty={self.COLLISION_PENALTY}")
             
         # 3. Approach Reward: encourage progress toward goal using distance delta
-        # If moving away from goal, apply 25% penalty of approach gain
+        # If moving away from goal, apply same penalty as approach gain
         if not done:
             if self.prev_goal_dist is not None:
                 delta = self.prev_goal_dist - dist  # positive if getting closer
@@ -507,8 +657,8 @@ class GazeboEnv(Node):
                     # Getting closer to goal
                     reward += delta * self.APPROACH_GAIN
                 else:
-                    # Moving away from goal - apply 25% penalty
-                    reward += delta * self.APPROACH_GAIN * 0.25
+                    # Moving away from goal - apply full penalty (same weight as approach)
+                    reward += delta * self.APPROACH_GAIN
             self.prev_goal_dist = dist
 
         # 3.1 Heading Alignment Reward: reward reduction in absolute heading error
@@ -520,10 +670,28 @@ class GazeboEnv(Node):
         # 3.2 Anti-Spin Penalty: discourage turning in place
         if v < self.SPIN_V_THRESHOLD and abs(w) > self.SPIN_W_THRESHOLD:
             reward -= self.SPIN_PENALTY
+        
+        # 3.2.1 Continuous turning penalty: discourage sustained circling
+        self.turning_history.append(w)
+        if len(self.turning_history) > self.TURNING_HISTORY_SIZE:
+            self.turning_history.pop(0)
+        
+        if len(self.turning_history) >= self.TURNING_HISTORY_SIZE:
+            # Check if robot is continuously turning in same direction
+            avg_turn = np.mean(self.turning_history)
+            if abs(avg_turn) > self.CONTINUOUS_TURN_THRESHOLD:
+                # Check if all turns are in same direction (all positive or all negative)
+                all_same_direction = all(t > 0 for t in self.turning_history) or all(t < 0 for t in self.turning_history)
+                if all_same_direction:
+                    reward -= self.CONTINUOUS_TURN_PENALTY
 
         # 3.3 Forward Bias when far from goal
         if not done and dist > (self.GOAL_DIST_THRESHOLD + 0.2):
             reward += self.FORWARD_BIAS_GAIN * (v / self.MAX_V)
+        
+        # 3.4 Additional forward bonus when heading is aligned
+        if not done and abs(heading_error) < 0.5:  # ~28 degrees
+            reward += 0.02 * (v / self.MAX_V)  # Extra reward for moving forward when aligned (small)
         
         # 4. Smoothness/Time Penalty
         reward -= 0.01 # Time step

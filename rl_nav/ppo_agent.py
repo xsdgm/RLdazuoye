@@ -22,10 +22,11 @@ class PPOAgent:
         
         with torch.no_grad():
             action, log_prob, value = self.policy.get_action(lidar, state, deterministic)
-            
-        return action.cpu().numpy()[0], log_prob.cpu().numpy()[0], value.cpu().numpy()[0]
+        
+        # Ensure value is a scalar by squeezing out batch and feature dimensions
+        return action.cpu().numpy()[0], log_prob.cpu().numpy()[0], value.cpu().numpy()[0, 0]
     
-    def update(self, buffer, batch_size=64, epochs=10):
+    def update(self, buffer, next_value=0.0, batch_size=64, epochs=10):
         # Unpack buffer
         lidars = torch.FloatTensor(np.array(buffer['lidars'])).to(self.device)
         states = torch.FloatTensor(np.array(buffer['states'])).to(self.device)
@@ -40,20 +41,23 @@ class PPOAgent:
         advantages = []
         gae = 0
         
-        # Append 0 for the last value if not provided (assuming done)
-        values = values + [0]
+        # Use the provided next_value for bootstrapping (correct handling of truncated episodes)
+        values = values + [next_value]
         
         for i in reversed(range(len(rewards))):
             delta = rewards[i] + self.gamma * values[i+1] * (1 - dones[i]) - values[i]
             gae = delta + self.gamma * self.gae_lambda * (1 - dones[i]) * gae
             advantages.insert(0, gae)
             returns.insert(0, gae + values[i])
-            
-        advantages = torch.FloatTensor(advantages).to(self.device)
-        returns = torch.FloatTensor(returns).to(self.device)
+        
+        # Convert to numpy first, then to tensor for better performance
+        advantages = torch.FloatTensor(np.array(advantages)).to(self.device)
+        returns = torch.FloatTensor(np.array(returns)).to(self.device)
         
         # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # Normalize returns（关键：减小critic loss数值）
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
         
         # PPO Update Loop
         dataset_size = len(rewards)
@@ -88,7 +92,8 @@ class PPOAgent:
                 surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * b_advantages.unsqueeze(1)
                 actor_loss = -torch.min(surr1, surr2).mean()
                 
-                # Critic Loss
+                # Critic Loss - ensure shapes match
+                # value is (batch, 1), returns should also be (batch, 1)
                 critic_loss = self.mse_loss(value, b_returns.unsqueeze(1))
                 
                 # Total Loss
